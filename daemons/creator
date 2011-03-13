@@ -1,0 +1,9 @@
+#!/usr/bin/env ruby
+require 'angels' 
+
+Angels.run_loop('creator', load_rails: true, default_env: "production", exception_handler: :hoptoad) do  
+  EuresClient::Creator::run
+end
+
+
+
