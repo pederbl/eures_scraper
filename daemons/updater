@@ -1,0 +1,7 @@
+#!/usr/bin/env ruby
+require 'angels' 
+
+Angels.run_loop('updater', retry: true, load_rails: true, default_env: "production", exception_handler: :hoptoad) do  
+  EuresClient::Updater::run
+end
+

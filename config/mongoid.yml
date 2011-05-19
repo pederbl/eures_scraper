@@ -8,13 +8,13 @@ defaults: &defaults
 
 development:
   host: localhost
-  database: eures_scraper
+  database: base 
 
 test:
   host: localhost
-  database: eures_scraper_test
+  database: base_test
 
 # set these environment variables on your prod server
 production:
   host: localhost
-  database: eures_scraper
+  database: base

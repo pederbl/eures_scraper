@@ -1,0 +1,1 @@
+FoundJobOpening.skip(62940).limit(10000).each_with_index { |job, i| puts i.to_s; EuresClient::get_job_info(job) }

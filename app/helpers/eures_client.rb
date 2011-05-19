@@ -11,7 +11,7 @@ module EuresClient
       return html
     rescue => e
       puts e.message
-      if _r ||= 0 and (_r += 1) < 20 
+      if _r ||= 0 and (_r += 1) < 20
         sleep _r * 1
         retry
       end
@@ -22,7 +22,9 @@ module EuresClient
   def self.get_nokogiri_body(url, error_text = nil)
     html = get_html(url, error_text)
     return nil unless html
-    Nokogiri::HTML(html).xpath('//body').first 
+    html.gsub!(/(\r?\n|\t)/, "")
+    html.gsub!(/(.*<th colspan="4">Description:<\/th> *<\/tr> *<tr> *<td colspan="4" class="JRTitle">)(.*?)( *<\/td> *<\/tr> *<tr> *<td colspan="\d" class="JRTitle">.*)/) { |s| last_html = $3; "#{$1}#{$2.gsub(/<\/?[^>]*>/, " ").gsub(/<.*$/, "")}#{last_html}" }
+    Nokogiri::HTML(html, nil, "utf-8")
   end
 
   class Finder
@@ -32,7 +34,7 @@ module EuresClient
     end
 
     def self.run
-      logger = Logger.new(Rails.root.join("log", "finder.log"))
+      @logger = Logger.new(Rails.root.join("log", "finder.log"))
       start_time = Time.now
     
       (0..2).each { |i| 
@@ -42,19 +44,21 @@ module EuresClient
       listing_urls = {}
     
       EuresClient::isco_codes.each { |code|
-        logger.info(code)
+        @logger.info("#{code} #{Time.now}")
         next unless code.length == 3
+        start_isco = Time.now
         EuresClient::locations.each { |country, regions|
-          logger.info("\t#{code}: #{country}")
+          num_results = 0
+          start_country = Time.now
           regions.each { |region|
-            #puts "\t\t#{region}"
             url = list_url(isco: code, country: country, region: region)
             while url.present?
               doc = EuresClient::get_nokogiri_body(url)
               break unless doc
               results = doc.css('.JResult')
               break unless results.present?
-              
+              num_results += results.length 
+
               results.each { |result|
                 link = result.css('.JRTitle a').first
                 onclick = link['onclick']
@@ -72,7 +76,9 @@ module EuresClient
               url = next_link ? 'http://ec.europa.eu/eures/eures-searchengine/servlet' + next_link['href'][1..-1] : nil
             end
           }
+          @logger.info("\t#{country} #{num_results} #{"%.0f" % (Time.now - start_country)}s")
         }
+        @logger.info("\t#{"%.0f" % (Time.now - start_isco)}s")
       }
       FoundJobOpening.where(:not_found_count.gt => 2).each { |r| r.delete }
     
@@ -82,38 +88,739 @@ module EuresClient
 
   class Creator
     def self.run
-      logger = Logger.new(Rails.root.join("log", "creator.log"))
-      FoundJobOpening.where(job_opening_id: nil, deleted_at: nil).each { |found_job_opening| 
-        puts found_job_opening.source_url
-        doc = EuresClient::get_nokogiri_body(found_job_opening.source_url)
-        next if doc.nil?
-        if doc.to_html.include?("There has been an error trying to show job vacancy")
+      @logger = Logger.new(Rails.root.join("log", "creator.log"))
+      found_job_openings = FoundJobOpening.where(job_opening_id: nil, deleted_at: nil)
+      ids = FoundJobOpening.where(:job_opening_id => nil, deleted_at: nil).map { |d| d.id }
+      @logger.info("count: #{ids.count}")
+      ids.each_with_index { |id, idx|
+        @logger.info("#{idx + 1}/#{ids.count}")
+        found_job_opening = FoundJobOpening.where(_id: id).first
+        attrs = EuresClient::get_job_info(found_job_opening)
+        if attrs.nil?
+          @logger.info("delete")
           found_job_opening.delete
-          next
+          next 
         end
-        info = doc.css(".JRdetails")
-        attrs = {
-          updated_at: Time.now,
-          source: "ec.europa.eu",
-          source_id: found_job_opening.source_id,
-          source_url: found_job_opening.source_url
-        }
-        begin
-          attrs[:title] = info.xpath("//tr/th[.='Title:']/following-sibling::td[1]/span").first.content
-          attrs[:body] = info.xpath("//tr/th[.='Description:']/../following-sibling::tr[1]/td").first.try(:content)
-          attrs[:employer] = {}
-          attrs[:employer][:name] = info.xpath("//td[@class='JRTitle']/strong[.='Employer']/../../following-sibling::tr[1]/td").first.content.strip
-        rescue => e
-          raise [e.message, found_job_opening.source_url, doc.to_html].inspect
-        end
+        attrs[:updated_at] = Time.now
         job_opening = JobOpening.create!(attrs)
         found_job_opening.job_opening_id = job_opening.id
+        found_job_opening.synced_at = Time.now
         found_job_opening.save!
-        logger.info(job_opening.inspect)
-        logger.info(job_opening.employer.inspect)
+        @logger.info(job_opening.slug)
       }
     end
   end
+
+  class Updater 
+    def self.run
+      @logger = Logger.new(Rails.root.join("log", "updater.log"))
+      ids = []
+      skip = 0
+      limit = 10000
+      loop {
+        new_ids = FoundJobOpening.where(:job_opening_id.ne => nil, deleted_at: nil).asc(:synced_at).skip(skip).limit(limit).map(&:id)
+        break if new_ids.blank?
+        ids += new_ids
+        skip += limit
+        @logger.info(skip.to_s)
+      }
+      ids.each_with_index { |id, idx|
+        @logger.info("\n#{idx}/#{ids.count}")
+        sync(FoundJobOpening.where(_id: id).first)
+      }
+    end
+
+    def self.sync_job(slug)
+      @logger = Logger.new(STDOUT)
+      job_opening = JobOpening.where(slug: slug).first
+      found_job_opening = FoundJobOpening.where(job_opening_id: job_opening.id).first
+      sync(found_job_opening)
+    end
+
+    def self.sync(found_job_opening)
+      @logger.info("synced_at: #{found_job_opening.synced_at}")
+      attrs = EuresClient::get_job_info(found_job_opening)
+      if attrs.nil?
+        found_job_opening.delete
+        @logger.info("delete: #{found_job_opening.source_url}")
+      else
+        job = JobOpening.where(_id: found_job_opening.job_opening_id).first
+
+        # don't update publish_at: job.publish_at = attrs[:publish_at]
+        job.publish_until = attrs[:publish_until]
+        job.title = attrs[:title]
+        job.body = attrs[:body]
+        job.num_positions = attrs[:num_positions]
+        job.primary_language = attrs[:primary_language]
+        job.job_category_tags = attrs[:job_category_tags]
+        job.isco = attrs[:isco]
+        job.nace = attrs[:nace]
+        job.job_title = attrs[:job_title]
+        job.job_type = attrs[:job_type]
+
+        h = attrs[:employer]
+        if h.blank?
+          job.employer = nil
+        else
+          d = job.employer || Employer.new
+          d.name = h[:name]
+          d.national_id = h[:national_id]
+          d.email = h[:email]
+          d.phone = h[:phone]
+          d.fax = h[:fax]
+          d.website = h[:website]
+          d.mail_address = h[:mail_address]
+          d.visit_address = h[:visit_address]
+          d.text = h[:text]
+        end
+
+        h = attrs[:requirements]
+        if h.blank?
+          job.requirements = nil
+        else
+          d = job.requirements || Requirements.new
+          d.drivers_license = h[:drivers_license] 
+          d.education = h[:education] 
+          d.experience = h[:experience] 
+          d.own_car = h[:own_car] 
+          d.minimum_age = h[:minimum_age] 
+          d.maximum_age = h[:maximum_age] 
+          d.text = h[:text] 
+          d.languages = h[:language] 
+        end
+
+        h = attrs[:worktime]
+        if h.blank?
+          job.worktime = nil
+        else
+          d = job.worktime || Worktime.new
+          d.type = h[:type] 
+          d.hours_per_week = h[:hours_per_week] 
+          d.text = h[:text] 
+        end
+        
+        h = attrs[:duration]
+        if h.blank?
+          job.duration = nil
+        else
+          d = job.duration || Duration.new
+          d.length = h[:length] 
+          d.starts_on = h[:starts_on] 
+          d.ends_on = h[:ends_on] 
+          d.sub = h[:sub] 
+          d.text = h[:text] 
+        end
+        
+        h = attrs[:salary]
+        if h.blank?
+          job.salary = nil
+        else
+          d = job.salary || Salary.new
+          d.minimum = h[:minimum] 
+          d.maximum = h[:maximum] 
+          d.currency = h[:currency] 
+          d.period = h[:period] 
+          d.accommodation = h[:accommodation] 
+          d.meals = h[:meals] 
+          d.travel_expenses = h[:travel_expenses] 
+          d.relocation = h[:relocation] 
+          d.text = h[:text] 
+        end
+        
+        h = attrs[:application]
+        if h.blank?
+          job.application = nil
+        else
+          d = job.application || Application.new
+          d.contact = h[:contact] 
+          d.email = h[:email] 
+          d.mail = h[:mail] 
+          d.phone = h[:phone] 
+          d.url = h[:url] 
+          d.reference = h[:reference] 
+          d.deadline = h[:deadline] 
+          d.text = h[:text] 
+        end
+        
+        raise "no location" if attrs[:location].blank? 
+        job.location ||= Location.new
+        reset_fields(job.location, attrs[:location])
+        
+        job.contacts = attrs[:contacts]
+        job.union_contacts = attrs[:union_contacts]
+
+        job.save
+      end
+      found_job_opening.update_attributes(synced_at: Time.now)
+    end
+    
+    def self.reset_fields(doc, attrs)
+      doc.fields.keys.each { |k| doc.send("#{k}=", nil) }
+      attrs.each { |k, v| doc.send("#{k}=", v) }
+    end
+  end
+
+  def self.get_geonameid(attrs)
+    raise attrs.inspect unless attrs[:country]
+    
+    geonameid = GeonamesLocation.search(
+      country: attrs[:country],
+      admin1: attrs[:region],
+      admin2: attrs[:city]
+    ).first.try(:geonameid)
+
+    if geonameid.nil? and attrs[:city].present?
+      geonameid = GeonamesLocation.search(
+        country: attrs[:country],
+        admin1: attrs[:region],
+        admin3: attrs[:city]
+      ).first.try(:geonameid)
+    end
+
+    if geonameid.nil? and (attrs[:region].present? or attrs[:city].present?)
+      reduced_attrs = attrs.dup
+      if attrs[:city].present? 
+        reduced_attrs[:city] = nil
+      else
+        reduced_attrs[:region] = nil
+      end
+      puts "get_geonameid: #{attrs.inspect} => #{reduced_attrs.inspect}"
+      geonameid = get_geonameid(reduced_attrs)
+    end
+
+    raise attrs.inspect if geonameid.nil?
+    return geonameid
+  end
+
+  def self.get_job_info(found_job_opening)
+    url = found_job_opening.source_url
+    puts url
+    doc = EuresClient::get_nokogiri_body(url)
+    return nil if doc.nil?
+    if doc.to_html.include?("There has been an error trying to show job vacancy")
+      found_job_opening.delete
+      return nil
+    end
+    return nil if doc.to_html.include?("The server containing job vacancy information is currently down. Please try again later.")
+    info = doc.css(".JRdetails")
+    raise doc.to_html if info.blank?
+    language = 'x'
+    attrs = {
+      deleted_at: nil,
+      source: "ec.europa.eu",
+      source_id: found_job_opening.source_id,
+      source_url: found_job_opening.source_url,
+      primary_language: language,
+      employer: {},
+      requirements: { 
+        languages: []
+      },
+      worktime: {},
+      duration: {},
+      salary: {},
+      application: {},
+      location: {},
+      contacts: [],
+      union_contacts: []
+    }
+    application_text = []
+    salary_text = []
+    requirements_text = []
+    begin
+      job = JobOpening.new
+      
+      current_title = nil
+      current_subtitle = nil
+      info.xpath("//tr").each { |row|
+        row = Nokogiri::HTML(row.to_html, nil, "utf-8")
+        new_current_title = if row.xpath("//td/strong[.='Summary']").first;   :summary
+        elsif row.xpath("//td/strong[.='Geographical Information']").first;   :geographical_info
+        elsif row.xpath("//td/strong[.='Salary / Contract']").first;          :salary_contract
+        elsif row.xpath("//td/strong[.='Extras']").first;                     :extras
+        elsif row.xpath("//td/strong[.='Requirements']").first;               :requirements
+        elsif row.xpath("//td/strong[.='Employer']").first;                   :employer
+        elsif row.xpath("//td/strong[.='How to apply']").first;               :application
+        elsif row.xpath("//td/strong[.='Other Information']").first;          :other
+        else  nil
+        end
+        if new_current_title
+          current_title = new_current_title
+          current_subtitle = nil
+          next
+        end
+
+
+        new_current_subtitle = nil
+        case current_title
+        when :summary
+          if row.xpath("//tr/th[.='Description:']").first
+            new_current_subtitle = :description 
+          end
+
+        when :geographical_info
+
+        when :salary_contract
+
+        when :extras
+
+        when :requirements
+
+        when :employer
+
+        when :application
+
+        when :other
+
+        else
+          raise current_title
+        end
+        if new_current_subtitle
+          current_subtitle = new_current_subtitle
+          next
+        end
+        
+
+        case current_title
+        when :summary
+          key = row.xpath("//tr/th").first
+          key = key.content.strip[0..-2] if key
+          value = row.xpath("//tr/td").first.try(:content).try(:strip)
+          case current_subtitle
+          when nil
+            case key
+            when nil
+              next
+            when "Title"
+              if value.include?("Arbeitsort: ")
+                attrs[:location][:city] = value.scan(/Arbeitsort: (.*)/).first.try(:first) rescue raise([url, value].inspect)
+                value = value.gsub(/Arbeitsort: .*/, "").strip
+              end
+              attrs[:title] = { language => value }
+            when "Required languages"
+              value.split(",").each { |language|
+                language, proficiency = language.gsub(/[()]/, "").split("-")
+
+                language = parse_language(language)
+                
+                if language
+                  proficiency = parse_proficiency(proficiency) rescue raise([proficiency, url].inspect)
+                  attrs[:requirements][:languages] << LanguageRequirement.new(language: language, proficiency: proficiency)
+                end
+              }
+            when "Starting Date"
+              attrs[:duration][:starts_on] = Time.parse(value) rescue nil
+            when "Ending date"
+              attrs[:duration][:ends_on] = Time.parse(value) rescue nil
+            else raise [key, url].inspect
+            end
+          when :description
+            attrs[:body] = { language => row.content.try(:strip) }
+          else 
+            raise current_subtitle
+          end
+
+        when :geographical_info
+          if row.xpath("//tr/th[.='Country:']").first
+            country = row.xpath("//tr/td").first.content.strip
+            if country.present? 
+              attrs[:location][:country] = country_en_2_code(country)
+              attrs[:location][:region] = row.xpath("//tr/td")[1].try(:content).try(:strip)
+            end
+          else
+            next
+          end
+
+        when :salary_contract
+          key = row.xpath("//tr/th").first
+          next if key.nil?
+          key = key.content.strip[0..-2] 
+          value = row.xpath("//tr/td").first.content.try(:strip)
+          case key
+          when nil; next
+          when "Contract type"
+            duration, attrs[:worktime][:type] = case value
+            when "unbefristet Arbeitsplatz (Vollzeit)"; ["PERMANENT", "FULL_TIME"]
+            when "unbefristet Arbeitsplatz (Teilzeit)"; ["PERMANENT", "PART_TIME"]
+            when "befristet Arbeitsplatz (Vollzeit)"; ["TEMPORARY", "FULL_TIME"]
+            when "befristet Arbeitsplatz (Teilzeit)"; ["TEMPORARY", "PART_TIME"]
+            when "Arbeitsplatz (Vollzeit)"; ["PERMANENT", "FULL_TIME"]
+            when "Arbeitsplatz (Teilzeit)"; ["PERMANENT", "PART_TIME"]
+            when "ΟΡΙΣΜΕΝΟΥ-ΠΛΗΡΗΣ"; ["PERMANENT", "FULL_TIME"]
+            when "ΟΡΙΣΜΕΝΟΥ-ΜΕΡΙΚΗ"; ["PERMANENT", "PART_TIME"]
+            when "ΑΟΡΙΣΤΟΥ-ΠΛΗΡΗΣ"; ["TEMPORARY", "FULL_TIME"]
+            when "ΑΟΡΙΣΤΟΥ-ΜΕΡΙΚΗ"; ["TEMPORARY", "PART_TIME"]
+            when "ΕΠΟΧΙΚΗ-ΠΛΗΡΗΣ"; ["TEMPORARY", "FULL_TIME"]
+            when "ΕΠΟΧΙΚΗ-ΜΕΡΙΚΗ"; ["TEMPORARY", "PART_TIME"]
+            when "P"; ["PERMANENT", nil]
+            when "T"; ["TEMPORARY", nil]
+            when "PF - Full-Time"; ["PERMANENT", "FULL_TIME"]
+            when "PP - Part-Time"; ["PERMANENT", "PART_TIME"]
+            when "TF - Full-Time"; ["PERMANENT", "FULL_TIME"]
+            when "TP - Part-Time"; ["PERMANENT", "PART_TIME"]
+            when "F - Full-Time"; [nil, "FULL_TIME"]
+            when "P - Part-Time"; [nil, "PART_TIME"]
+            when "To Be Advised - Full-Time"; [nil, "FULL_TIME"]
+            when "To Be Advised - Part-Time"; [nil, "PART_TIME"]
+            when "Other - Full-Time"; [nil, "FULL_TIME"]
+            when "Other - Part-Time"; [nil, "PART_TIME"]
+            when "Permanente - Completo"; ["PERMANENT", "FULL_TIME"]
+            when "A Termo - Completo"; ["TEMPORARY", "FULL_TIME"]
+            when "Permanente - Parcial"; ["PERMANENT", "PART_TIME"]
+            when "A Termo - Parcial"; ["TEMPORARY", "PART_TIME"]
+            when /Vinnumálastofnun .*/; [nil, nil]
+            when "Traineeship"; attrs[:job_type] = "TRAINEE"; [nil, nil]
+            when / \+ /; value.gsub("-", "_").split(" + ")
+            else raise value
+            end
+
+            attrs[:duration][:length] = case duration
+            when "PERMANENT"; -1
+            when "TEMPORARY"; 0
+            when nil; nil
+            else
+              raise [value, duration].inspect
+            end
+            
+          when "Minimum salary"
+            attrs[:salary][:minimum] = parse_salary(value, attrs) rescue raise([value, url].inspect)
+          when "Maximum salary" 
+            attrs[:salary][:maximum] = parse_salary(value, attrs) rescue raise([value, url].inspect)
+          when "Salary currency"
+            attrs[:salary][:currency] = case value.downcase
+            when "pound (sterling)"; "GBP"
+            when "euro"; "EUR"
+            when "czech koruna"; "CZK"
+            when "swiss franc"; "CHF"
+            when "norwegian krone"; "NOK"
+            when "iceland krona"; "ISK"
+            when "swedish krona"; "SEK"
+            when "oth"; nil
+            when "n/k"; nil
+            when "******"; nil
+            else raise value.inspect
+            end
+          when "Salary tax" #ignore
+          when "Salary period"
+            attrs[:salary][:period] = case value
+            when "Hourly"; "H"
+            when "Daily"; "D"
+            when "Weekly"; "W"
+            when "Monthly"; "M"
+            when "Annually"; "Y"
+            when "ΗΜΕΡΗΣΙΟ"; "D"
+            when "ΜΗΝΙΑΙΟ"; "M"
+            when "Ano"; "Y"
+            when "Mês"; "M"
+            when "Dia"; "D"
+            when "Hora"; "H"
+            when "C"; nil
+            else 
+              if url =~ /job.jobnet.dk/ 
+                salary_text << value
+              else
+                raise value
+              end
+            end
+          when "Hours per week"
+            attrs[:worktime][:hours_per_week] = parse_value(value)
+          else
+            raise [key, url].inspect
+          end
+        when :extras
+          row.xpath("//tr/th").each_with_index { |key, index|
+            key = key.content.strip[0..-2]
+            value = row.xpath("//tr/td")[index].content.try(:strip)
+            case key
+            when "Accommodation provided"
+              attrs[:salary][:accommodation] = value == "Yes"
+            when "Meals included"
+              attrs[:salary][:meals] = value == "Yes"
+            when "Travel expenses"
+              attrs[:salary][:travel_expenses] = value == "Yes"
+            when "Relocation covered"
+              attrs[:salary][:relocation] = value == "Yes"
+            else raise key.inspect
+            end
+
+          }
+
+        when :requirements
+          key = row.xpath("//tr/th").first.content.strip[0..-2]
+          value = row.xpath("//tr/td").first.content.try(:strip)
+          case key
+          when "Education skills required"
+            attrs[:requirements][:education] = { language => value }
+
+          when "Professional qualifications required"
+            attrs[:requirements][:experience] = value == "No" ? 0 : -1
+
+          when "Experience required"
+            attrs[:requirements][:experience] = case value
+            when "Between 2 and 5 years"; 24
+            when "More than 5 years"; 60
+            when "None required"; 0
+            when "Up to 1 year"; 0
+            when "Up to 2 years"; 0
+            when "Required"; -1
+            when "See free text"; #ignore
+            when "Δεν Απαιτείται"; 0
+            when "1 Ετος"; 12
+            when /\d{1,2} Ετη/; 
+              value.scan(/(\d{1,2}) Ετη/).first.first.to_i * 12
+            when /\d{1,2} months in sector:/
+              requirements_text << "Experience required: #{value}"
+              value.scan(/(\d{1,2}) months in sector:/).first.first.to_i
+            else
+              if url =~ /213.13.163.2\/euresWS-LocalPes-ver2/ # portugal
+                requirements_text << value
+                nil
+              else
+                raise value
+              end
+            end
+
+          when "Driving license required"
+            value.gsub!(/\.$/, '')
+            attrs[:requirements][:drivers_license] = case value
+            when "Yes"; ["B"]
+            when "No"; []
+            when /^((A1|A|A3|B|BE|C1|C1\+E|C|CE|D1|D|DE|G|T)(, ?|$)){1,}/; 
+              arr = value.split(", ")
+              arr.sort
+            when "Motorcycle"; ["A"]
+            when "Car with up to 8 passengers; lorry up to 3.5 tons"; ["B"]
+            when "Car with 9 or more passengers"; ["C"] 
+            when "Lorry over 3.5 tons"; ["C"]
+            when /FS A1 Leichtkraftr.der/; ["A1"]
+            when /FS A Motorr.der/; ["A"]
+            when /FS B PKW\/Kleinbusse/; ["B"]
+            when /FS BE PKW\/Kleinbusse/; ["BE"]
+            when /FS C1 Leichte LKW/; ["C1"]
+            when /FS C1E Leichte LKW/; ["C1E"]
+            when /FS C Schwere LKW/; ["C"]
+            when /FS CE Schwere LKW/; ["CE"]
+            when /FS D1 Kleine Omnibusse/; ["D1"]
+            when /FS D1E Kleine Omnibusse/; ["D1E"]
+            when /FS D Omnibusse/; ["D"]
+            when /FS DE Omnibusse/; ["DE"]
+            when "Fahrerkarte"; ["B"]
+            when "Voiture jusqu'à 8 passagers; camion jusqu'à 3,5 T"; ["B"]
+            when "Véhicule de la classe B,C, ou D avec remorque"; ["BE", "CE", "DE"]
+            when "Camion au dessus de 3,5 tonnes"; ["C"]
+            when "ΜΟΤΟΣΙΚΛΕΤΑΣ ΕΩΣ 34 PS 25 KW Η 0,16 KW/KG"; ["A1"]
+            when "ΜΟΤΟΣΙΚΛΕΤΑΣ ΕΩΣ 34 PS = 25 KW Η 0,16 KW/KG"; ["A1"]
+            when "ΜΟΤΟΣΙΚΛΕΤΑ ΟΠΟΙΑΣΔΗΠΟΤΕ ΙΣΧΥΟΣ Η ΣΧΕΣΗΣ ΙΣΧΥΟΣ/ΒΑΡΟΥΣ"; ["A"]
+            when "ΕΠΙΒΑΤΙΚΑ ΕΩΣ 9 ΘΕΣΕΙΣ ΚΑΙ ΦΟΡΤΗΓΑ ΕΩΣ 3500 KGR. ΜΙΚΤΟ + ΡΥΜΟΥΛΚ. ΕΩΣ 750 KGR"; ["BE"]
+            when "ΦΟΡΤΗΓΑ ΕΩΣ 7500 KGR. ΜΙΚΤΟ + ΡΥΜΟΥΛΚ. ΕΩΣ 750 KGR"; ["C1"]
+            when "ΦΟΡΤΗΓΑ ΑΠΟ 3501 KGR ΕΩΣ ΤΟ ΜΕΓΙΣΤΟ ΕΠΙΤΡΕΠΟΜΕΝΟ ΒΑΡΟΣ ΤΟΥ ΚΑΘΕ ΦΟΡΤΗΓΟΥ + ΡΥΜΟΥΛΚ. ΕΩΣ 750 KGR"; ["CE"]
+            when "ΕΛΚΟΥΝ ΤΗΣ Δ ΚΑΤ. + ΡΥΜΟΥΛΚ. ΑΝΩ ΤΩΝ 750 KGR"; ["CE", "DE"]
+            when "ΕΛΚΟΥΝ ΤΗΣ Β ΚΑΤ. + ΡΥΜΟΥΛ. ΑΝΩ ΤΩΝ 3500 KGR Η ΡΥΜΟΥΛΚ. ΒΑΡΥΤΕΡΟ ΤΟΥ ΕΛΚΟΝΤΟΣ ΚΕΝΟΥ"; ["CE", "DE"]
+            when "ΕΛΚΟΥΝ ΤΗΣ Γ ΚΑΤ. + ΡΥΜΟΥΛΚ. ΑΝΩ ΤΩΝ 750 KGR"; ["CE"]
+            when "Vehicle of either class B,C or D with trailer"; ["BE", "CE", "DE"]
+            when "Gabelstaplerschein (Führerschein für Flurförderzeuge)"; requirements_text << value
+            when "Gabelstaplerschein ("; requirements_text << value
+            when "Fahrlehrerlaubnis Klasse A (alt: Kl.1, Motorräder)"; requirements_text << value
+            when "Fahrlehrerlaubnis Klasse BE (alt Kl.3, Grundlehrerlaubnis)"; requirements_text << value
+            when "Fahrlehrerlaubnis Klasse CE (alt Kl.2, LKW-Fahrerausbildung)"; requirements_text << value
+            when "Fahrlehrerlaubnis Klasse DE (Busfahrerausbildung)"; requirements_text << value
+            when "Führerschein Baumaschinen"; requirements_text << value
+            when "Lokomotiv-/Triebfahrzeugführerschein Klasse 1"; requirements_text << value
+            when "Lokomotiv-/Triebfahrzeugführerschein Klasse 2"; requirements_text << value
+            when "FS T Große Traktoren"; requirements_text << value
+            when "FS Fahrgastbeförderung (Taxen bzw. Krankenkraftwagen)"; requirements_text << value
+            when "Lokomotiv-/Triebfahrzeugführerschein Klasse 3"; requirements_text << value
+            when "FS L selbstf. land-, forstw. Arbeits- u. Zugmasch.(alt:FS 5)"; requirements_text << value
+            when "FS M Moped, Mokick (alt: FS 4)"; requirements_text << value
+            when "Gespannführerschein"; requirements_text << value
+            when "FS S Dreiräd. Kleinkrafträder, vierräd. Leichtkraftfahrzeuge"; requirements_text << value
+            when "FS Mofa und Krankenfahrstühle"; requirements_text << value
+            when "Ligeiros"; requirements_text << value
+            else raise [url, value].inspect
+            end
+
+          when "Minimum age"
+            attrs[:requirements][:minimum_age] = value.to_i
+            
+          when "Maximum age"
+            attrs[:requirements][:maximum_age] = value.to_i
+
+          else raise key
+          end
+
+        when :employer
+          value = row.xpath("//tr/td").first.content.try(:strip)
+          key = row.xpath("//tr/th").first.content.strip[0..-2]
+          key = case key
+          when "Name";        :name
+          when "Information"; :text
+          when "Address";     :mail_address
+          when "Phone";       :phone
+          when "Fax";         :fax
+          when "Email";       :email
+          else raise key
+          end
+          if key == :text
+            attrs[:employer][key] = { language => value }
+          else
+            attrs[:employer][key] = value
+          end
+
+        when :application
+          if row.to_html.include?("&gt;Contact:&lt;")
+            key = "Contact"
+            value = row.xpath("//tr/th").first.content.strip
+          else
+            key = row.xpath("//tr/th").first.content.strip[0..-2]
+            value = row.xpath("//tr/td").first.content.try(:strip)
+          end
+          case key
+          when "How to apply"
+            attrs[:application][:email] = value.scan(/\w*@\w*\.\w{2,6}/).first
+            attrs[:application][:url] = value.scan(/(http:\/\/[^ ]*|www\.[^ ]*\.\w{2,6}\/[^ ]*)/).first.try(:first)
+            application_text << value
+          when "Contact"
+            attrs[:application][:contact] = value
+          when "Last date for application"
+            attrs[:application][:deadline] = Time.parse(value) rescue nil
+          else raise key.inspect
+          end
+
+        when :other
+          row.xpath("//tr/th").each_with_index { |key, index|
+            key = key.content.strip[0..-2]
+            value = row.xpath("//tr/td")[index].content.try(:strip)
+            case key
+            when "Date published"
+              published_at = Time.parse(value)
+              published_at = Time.now if published_at.to_date.today?
+              attrs[:publish_at] = published_at 
+              attrs[:publish_at] = Time.now if Time.now < attrs[:publish_at]
+            when "Nace code"
+              attrs[:nace] = value
+            when "ISCO code"
+              attrs[:isco] = value.gsub(/0+$/, "")
+            when "Last Modification Date"; #ignore
+            when "National reference";     # ignore
+            when "Eures reference"; # ignore
+            when "Number of posts"
+              attrs[:num_positions] = value.to_i
+
+            else raise key.inspect
+            end
+
+          }
+
+        else
+          raise current_title
+        end
+
+        current_subtitle = nil
+        
+      }
+
+      
+    rescue => e
+      raise e
+      #raise [e.message, found_job_opening.source_url, doc.to_html].inspect
+    end
+
+    return nil unless attrs[:location][:country].present?
+    attrs[:location][:geonameid] = get_geonameid(attrs[:location])
+
+    attrs[:application][:text] = { language => application_text.join("\n") } if application_text.present?
+    attrs[:salary][:text] = { language => salary_text.join("\n") } if salary_text.present?
+    attrs[:requirements][:text] = { language => requirements_text.join("\n") } if requirements_text.present?
+
+    attrs[:publish_at] = Time.now #unless attrs[:publish_at]
+    #return nil if attrs[:publish_at] < 120.days.ago
+
+    return attrs.with_indifferent_access 
+  end
+
+  def self.parse_language(value)
+    case value.strip.downcase
+    when /(pt)/; value.strip.downcase
+    when "czech"; "cs"
+    when "deutsch"; "de"
+    when "dutch"; "nl"
+    when "english"; "en"
+    when "englisch"; "en"
+    when "french"; "fr"
+    when "german"; "de"
+    when "italian"; "it"
+    when "português"; "pt"
+    when "polish"; "pl"
+    when "romanian"; "ro"
+    when "russisch"; "ru"
+    when "spanish"; "es"
+    when "ΑΓΓΛΙΚΑ"; "en"
+    when "other"; nil
+    when "**"; nil
+    else raise value
+    end
+  end
+
+  def self.parse_proficiency(value)
+    return nil if value.nil?
+
+    case value.strip.downcase
+    when "elementary"; 1
+    when "basic"; 2
+    when "good"; 3
+    when "fair"; 3
+    when "working knowledge"; 3
+    when "very good"; 4
+    when "fluent"; 4
+    when "mother tongue"; 5
+
+    when "grundkenntnisse"; 2
+    when "gut"; 3
+    when "erweiterte kenntnisse"; 4
+    when "muttersprache"; 5
+    when "zwingend erforderlich"; nil
+    when "verhandlungssicher"; nil
+
+    else raise value 
+    end
+  end
+
+  def self.parse_value(value)
+    amount = value.dup
+    amount.gsub!(" ", "")
+    amount.gsub!(/[,.]\d{3}/) { |s| s[1..-1] }
+    amount.gsub!(/[,]\d{2}/) { |s| s.gsub(",", ".") }
+    amount.to_f
+  end
+
+  def self.parse_salary(value, attrs)
+    value = value.strip
+    salary = case value.downcase
+    when /\A[+-]?[\d,]+?(\.\d+)?\Z/; parse_value(value)
+    when /and pound;\d+ and.../; value.scan(/and pound;(\d+) and.../).first.first.to_f
+    when /and pound;\d+\/annum up to and.../
+      attrs[:salary][:period] = "Y"
+      value.scan(/and pound;(\d+)\/annum up to and.../i).first.first.to_f
+    when /gbp \d+ - gbp \d+ per hour/
+      attrs[:salary][:period] = "H"
+      min, max = value.downcase.scan(/gbp (\d+) - gbp (\d+) per hour/).first
+      attrs[:salary][:maximum] = max.to_f
+      min.to_f
+    when "exceeds nat min wage"; 
+      attrs[:salary][:text] = value
+      nil
+
+    when "n/a"; nil
+    when "please contact us for more information"; nil
+    when "nach verhandlung"; nil
+    when "n.v."; nil
+    else 
+      attrs[:salary][:text] = value
+      nil
+    end
+    salary = nil if salary == 0.0
+    return salary
+  end
+
 
   def self.isco_codes
     return @isco_codes if @isco_codes
@@ -654,6 +1361,49 @@ module EuresClient
     return @isco_codes = codes
   end
   
+  def self.country_en_2_code(country)
+    unless @countries_en
+      countries = {}
+      countries["Austria"] = "AT" 
+      countries["Belgium"] = "BE" 
+      countries["Bulgaria"] = "BG" 
+      countries["Cyprus"] = "CY" 
+      countries["Czech Republic"] = "CZ" 
+      countries["Denmark"] = "DK" 
+      countries["Estonia"] = "EE" 
+      countries["Finland"] = "FI" 
+      countries["France"] = "FR" 
+      countries["Germany"] = "DE" 
+      countries["Greece"] = "GR" 
+      countries["Hungary"] = "HU" 
+      countries["Iceland"] = "IS" 
+      countries["Ireland"] = "IR" 
+      countries["Italy"] = "IT" 
+      countries["Latvia"] = "LV" 
+      countries["Liechtenstein"] = "LI" 
+      countries["Lithuania"] = "LT" 
+      countries["Luxembourg"] = "LU" 
+      countries["Malta"] = "MT" 
+      countries["Netherlands"] = "NL" 
+      countries["NL"] = "NL" 
+      countries["Norway"] = "NO" 
+      countries["Poland"] = "PL" 
+      countries["Portugal"] = "PT" 
+      countries["Romania"] = "RO" 
+      countries["Slovakia"] = "SK" 
+      countries["Slovenia"] = "SI" 
+      countries["Spain"] = "ES" 
+      countries["Sweden"] = "SE" 
+      countries["Switzerland"] = "CH" 
+      countries["United Kingdom"] = "GB" 
+      @countries_en = countries
+    end 
+    country_code = @countries_en[country]
+    raise country.inspect unless country_code
+    return country_code
+  end
+
+
   def self.locations
     return @locations if @locations
 

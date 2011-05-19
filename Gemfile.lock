@@ -1,12 +1,17 @@
 PATH
+  remote: ../geonames
+  specs:
+    geonames (0.0.1)
+
+PATH
   remote: ../job_opening_models
   specs:
     job_opening_models (0.0.1)
 
 PATH
-  remote: ../jobadice
+  remote: ../mongoid_translated_strings
   specs:
-    jobadice (0.0.1)
+    mongoid_translated_strings (0.0.1)
 
 GEM
   remote: http://rubygems.org/
@@ -44,7 +49,7 @@ GEM
     builder (2.1.2)
     erubis (2.6.6)
       abstract (>= 1.0.0)
-    hoptoad_notifier (2.4.6)
+    hoptoad_notifier (2.4.9)
       activesupport
       builder
     i18n (0.5.0)
@@ -63,8 +68,8 @@ GEM
       will_paginate (~> 3.0.pre)
     nokogiri (1.4.4)
     polyglot (0.3.1)
-    rack (1.2.1)
-    rack-mount (0.6.13)
+    rack (1.2.2)
+    rack-mount (0.6.14)
       rack (>= 1.0.0)
     rack-test (0.5.7)
       rack (>= 1.0)
@@ -84,11 +89,12 @@ GEM
     rake (0.8.7)
     rest-client (1.6.1)
       mime-types (>= 1.16)
-    stringex (1.2.0)
+    riddle (1.2.2)
+    stringex (1.2.1)
     thor (0.14.6)
     treetop (1.4.9)
       polyglot (>= 0.3.1)
-    tzinfo (0.3.24)
+    tzinfo (0.3.26)
     will_paginate (3.0.pre2)
 
 PLATFORMS
@@ -96,11 +102,13 @@ PLATFORMS
 
 DEPENDENCIES
   bson_ext (~> 1.2)
+  geonames!
   hoptoad_notifier
   job_opening_models!
-  jobadice!
   mongoid (= 2.0.0.rc.6)
+  mongoid_translated_strings!
   nokogiri
   rails (= 3.0.4)
   rest-client
+  riddle
   stringex
