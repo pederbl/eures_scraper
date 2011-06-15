@@ -10,6 +10,7 @@ class JobOpening
   field :sphinx_id, type: Integer
 
   index :slug, unique: true
+  index :not_found_count
 
   validates :publish_at, presence: true
 

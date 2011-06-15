@@ -48,6 +48,7 @@ module EuresClient
         next unless code.length == 3
         start_isco = Time.now
         EuresClient::locations.each { |country, regions|
+          #@logger.info([country, regions].inspect)
           num_results = 0
           start_country = Time.now
           regions.each { |region|
@@ -80,9 +81,15 @@ module EuresClient
         }
         @logger.info("\t#{"%.0f" % (Time.now - start_isco)}s")
       }
-      FoundJobOpening.where(:not_found_count.gt => 2).each { |r| r.delete }
-    
       #puts get_nokogiri_body(url).inspect
+    end
+  end
+
+  class Deleter
+    def self.run
+      @logger.info("start deleting not_found job openings: #{Time.now}")
+      FoundJobOpening.where(:not_found_count.gt => 2).map(&:id).each { |id| FoundJobOpening.find(id).delete }
+      @logger.info("deleting not_found job openings done: #{Time.now}")
     end
   end
 
@@ -414,7 +421,7 @@ module EuresClient
             else raise [key, url].inspect
             end
           when :description
-            attrs[:body] = { language => row.content.try(:strip) }
+            attrs[:body] = { language => parse_body(row.content.try(:strip)) }
           else 
             raise current_subtitle
           end
@@ -488,12 +495,14 @@ module EuresClient
           when "Salary currency"
             attrs[:salary][:currency] = case value.downcase
             when "pound (sterling)"; "GBP"
+            when "pound sterling"; "GBP"
             when "euro"; "EUR"
             when "czech koruna"; "CZK"
             when "swiss franc"; "CHF"
             when "norwegian krone"; "NOK"
             when "iceland krona"; "ISK"
             when "swedish krona"; "SEK"
+            when "leu"; "LEU"
             when "oth"; nil
             when "n/k"; nil
             when "******"; nil
@@ -735,6 +744,11 @@ module EuresClient
     #return nil if attrs[:publish_at] < 120.days.ago
 
     return attrs.with_indifferent_access 
+  end
+
+  def self.parse_body(value)
+    #Swedish jobs are misformated in this way. tradeoff: this will screw up First.Last@example.com.
+    value.gsub(/(\w[.?!;])(\w)/) { |s| ($1 == $1.downcase && $2 == $2.upcase) ? "#{$1}\n\n#{$2}" : s } 
   end
 
   def self.parse_language(value)
@@ -1365,6 +1379,7 @@ module EuresClient
     unless @countries_en
       countries = {}
       countries["Austria"] = "AT" 
+      countries["AS"] = "AS"
       countries["Belgium"] = "BE" 
       countries["Bulgaria"] = "BG" 
       countries["Cyprus"] = "CY" 
@@ -1387,6 +1402,7 @@ module EuresClient
       countries["Netherlands"] = "NL" 
       countries["NL"] = "NL" 
       countries["Norway"] = "NO" 
+      countries["NO"] = "NO" 
       countries["Poland"] = "PL" 
       countries["Portugal"] = "PT" 
       countries["Romania"] = "RO" 
@@ -1396,6 +1412,7 @@ module EuresClient
       countries["Sweden"] = "SE" 
       countries["Switzerland"] = "CH" 
       countries["United Kingdom"] = "GB" 
+      countries["GE"] = "GE"
       @countries_en = countries
     end 
     country_code = @countries_en[country]
