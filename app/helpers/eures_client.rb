@@ -628,10 +628,7 @@ module EuresClient
             when "Vehicle of either class B,C or D with trailer"; ["BE", "CE", "DE"]
             when "Gabelstaplerschein (Führerschein für Flurförderzeuge)"; requirements_text << value
             when "Gabelstaplerschein ("; requirements_text << value
-            when "Fahrlehrerlaubnis Klasse A (alt: Kl.1, Motorräder)"; requirements_text << value
-            when "Fahrlehrerlaubnis Klasse BE (alt Kl.3, Grundlehrerlaubnis)"; requirements_text << value
-            when "Fahrlehrerlaubnis Klasse CE (alt Kl.2, LKW-Fahrerausbildung)"; requirements_text << value
-            when "Fahrlehrerlaubnis Klasse DE (Busfahrerausbildung)"; requirements_text << value
+            when /Fahrlehrerlaubnis/; requirements_text << value
             when "Führerschein Baumaschinen"; requirements_text << value
             when "Lokomotiv-/Triebfahrzeugführerschein Klasse 1"; requirements_text << value
             when "Lokomotiv-/Triebfahrzeugführerschein Klasse 2"; requirements_text << value
@@ -748,7 +745,7 @@ module EuresClient
 
   def self.parse_body(value)
     #Swedish jobs are misformated in this way. tradeoff: this will screw up First.Last@example.com.
-    value.gsub(/(\w[.?!;])(\w)/) { |s| ($1 == $1.downcase && $2 == $2.upcase) ? "#{$1}\n\n#{$2}" : s } 
+    value.gsub(/(\w[.?!;])(\w)/) { |s| a = $1; b = $2; (a == a.downcase && b == b.upcase && b =~ /\D/) ? "#{a}\n\n#{b}" : s } 
   end
 
   def self.parse_language(value)
