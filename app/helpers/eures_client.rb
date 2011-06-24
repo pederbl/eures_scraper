@@ -625,11 +625,12 @@ module EuresClient
             when "ΕΛΚΟΥΝ ΤΗΣ Δ ΚΑΤ. + ΡΥΜΟΥΛΚ. ΑΝΩ ΤΩΝ 750 KGR"; ["CE", "DE"]
             when "ΕΛΚΟΥΝ ΤΗΣ Β ΚΑΤ. + ΡΥΜΟΥΛ. ΑΝΩ ΤΩΝ 3500 KGR Η ΡΥΜΟΥΛΚ. ΒΑΡΥΤΕΡΟ ΤΟΥ ΕΛΚΟΝΤΟΣ ΚΕΝΟΥ"; ["CE", "DE"]
             when "ΕΛΚΟΥΝ ΤΗΣ Γ ΚΑΤ. + ΡΥΜΟΥΛΚ. ΑΝΩ ΤΩΝ 750 KGR"; ["CE"]
+            when "ΛΕΩΦΟΡΕΙΑ ΜΕ ΔΥΝΑΤΟΤΗΤΑ ΕΛΞΕΩΣ ΕΛΑΦΡΟΥ ΡΥΜΟΥΛΚΟΥΜΕΝΟΥ - 750 KGR"; ["DE"]
             when "Vehicle of either class B,C or D with trailer"; ["BE", "CE", "DE"]
             when "Gabelstaplerschein (Führerschein für Flurförderzeuge)"; requirements_text << value
             when "Gabelstaplerschein ("; requirements_text << value
             when /Fahrlehrerlaubnis/; requirements_text << value
-            when "Führerschein Baumaschinen"; requirements_text << value
+            when /Führerschein/; requirements_text << value
             when "Lokomotiv-/Triebfahrzeugführerschein Klasse 1"; requirements_text << value
             when "Lokomotiv-/Triebfahrzeugführerschein Klasse 2"; requirements_text << value
             when "FS T Große Traktoren"; requirements_text << value
