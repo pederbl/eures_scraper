@@ -256,7 +256,11 @@ module EuresClient
         job.contacts = attrs[:contacts]
         job.union_contacts = attrs[:union_contacts]
 
-        job.save
+        if job.employer and job.employer.name and ["Ristorante Arcimboldo"].include?(job.employer.name)
+          found_job_opening.delete
+        else
+          job.save
+        end
       end
       found_job_opening.update_attributes(synced_at: Time.now)
     end
@@ -499,7 +503,7 @@ module EuresClient
             when "euro"; "EUR"
             when "czech koruna"; "CZK"
             when "swiss franc"; "CHF"
-            when "norwegian krone"; "NOK"
+            when /nor.egian kron./i; "NOK"
             when "iceland krona"; "ISK"
             when "swedish krona"; "SEK"
             when "leu"; "LEU"
@@ -731,6 +735,8 @@ module EuresClient
       #raise [e.message, found_job_opening.source_url, doc.to_html].inspect
     end
 
+    return nil if black_listed_employers.include?(attrs[:employer][:name])
+
     return nil unless attrs[:location][:country].present?
     attrs[:location][:geonameid] = get_geonameid(attrs[:location])
 
@@ -831,6 +837,12 @@ module EuresClient
     end
     salary = nil if salary == 0.0
     return salary
+  end
+
+  def self.black_listed_employers
+    return @black_listed_employers if @black_listed_employers
+    s = File.read(File.join(Rails.root, "config", "black_listed_employers.txt"))
+    @black_listed_employers = s.split("\n").map { |employer| employer.strip }
   end
 
 

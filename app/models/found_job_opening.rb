@@ -10,6 +10,7 @@ class FoundJobOpening
   index :source_id
   index :deleted_at
   index :synced_at
+  index :job_opening_id
 
   def delete
     self.deleted_at = Time.now
